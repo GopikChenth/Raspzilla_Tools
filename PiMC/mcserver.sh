@@ -60,8 +60,8 @@ check_dependencies() {
   if [ ${#missing[@]} -gt 0 ]; then
     warn "Missing dependencies: ${missing[*]}"
     info "Installing them now..."
-    sudo apt update -qq
-    sudo apt install -y "${missing[@]}" &>/dev/null
+    sudo apt-get update -qq
+    sudo apt-get install -y "${missing[@]}" 2>&1 | grep -E '(installed|upgraded|error)' || true
     success "Dependencies installed!"
   fi
 }
@@ -69,14 +69,51 @@ check_dependencies() {
 # ================================================================
 #  PAPER MC API
 # ================================================================
+
+# Cache for versions (avoid repeated API calls)
+VERSIONS_CACHE=""
+
 get_versions() {
-  curl -s "$PAPER_API" | jq -r '.versions[]' 2>/dev/null
+  # Return cached result if available
+  if [ -n "$VERSIONS_CACHE" ]; then
+    echo "$VERSIONS_CACHE"
+    return 0
+  fi
+
+  local raw
+  raw=$(curl -s --connect-timeout 10 --max-time 15 "$PAPER_API" 2>/dev/null)
+
+  if [ -z "$raw" ]; then
+    return 1
+  fi
+
+  # Use jq if available, otherwise fall back to grep/sed parsing
+  if command -v jq &>/dev/null; then
+    VERSIONS_CACHE=$(echo "$raw" | jq -r '.versions[]?' 2>/dev/null)
+  else
+    # Fallback: grep the versions array from raw JSON
+    VERSIONS_CACHE=$(echo "$raw" | grep -o '"[0-9][0-9]*\.[0-9][^"]*"' | tr -d '"')
+  fi
+
+  if [ -z "$VERSIONS_CACHE" ]; then
+    return 1
+  fi
+
+  echo "$VERSIONS_CACHE"
 }
 
 get_latest_build() {
   local version="$1"
-  curl -s "$PAPER_API/versions/$version/builds" \
-    | jq -r '.builds[-1].build' 2>/dev/null
+  local raw
+  raw=$(curl -s --connect-timeout 10 --max-time 15 \
+    "$PAPER_API/versions/$version/builds" 2>/dev/null)
+
+  if command -v jq &>/dev/null; then
+    echo "$raw" | jq -r '.builds[-1].build?' 2>/dev/null
+  else
+    # Fallback: get the last build number from JSON
+    echo "$raw" | grep -o '"build":[0-9]*' | tail -1 | grep -o '[0-9]*'
+  fi
 }
 
 download_paper() {
@@ -84,12 +121,15 @@ download_paper() {
   local build="$2"
   local dest="$3"
   local url="$PAPER_API/versions/$version/builds/$build/downloads/paper-$version-$build.jar"
-  curl -L --progress-bar "$url" -o "$dest"
+  curl -L --progress-bar --connect-timeout 15 --max-time 600 "$url" -o "$dest"
 }
 
 version_exists() {
   local version="$1"
-  get_versions | grep -qx "$version"
+  # Use cache if already populated
+  local all_versions
+  all_versions=$(get_versions 2>/dev/null)
+  echo "$all_versions" | grep -qx "$version"
 }
 
 # ================================================================
@@ -191,35 +231,51 @@ create_server() {
 
   echo ""
 
+  # ── Dependencies (ensure installed before API calls) ────────────
+  check_dependencies
+
   # ── Version Selection ─────────────────────────────────────────
   info "Fetching available PaperMC versions..."
-  VERSIONS=$(get_versions)
+  VERSIONS=$(get_versions 2>/dev/null)
+  API_OK=true
 
   if [ -z "$VERSIONS" ]; then
-    error "Could not fetch versions. Check internet connection."
-    exit 1
-  fi
-
-  # Show last 10 versions
-  echo ""
-  echo -e "  ${BOLD}Available versions (latest 10):${NC}"
-  echo "$VERSIONS" | tail -10 | while read -r v; do
-    echo -e "    ${GREEN}•${NC} $v"
-  done
-  LATEST=$(echo "$VERSIONS" | tail -1)
-  echo ""
-
-  while true; do
-    echo -ne "  ${CYAN}Minecraft version${NC} [press Enter for latest: ${GREEN}$LATEST${NC}]: "
-    read -r MC_VERSION
-    MC_VERSION=${MC_VERSION:-$LATEST}
-
-    if version_exists "$MC_VERSION"; then
-      break
-    else
-      error "'$MC_VERSION' is not a valid PaperMC version. Try again."
+    echo ""
+    warn "Could not reach PaperMC API. Possible causes:"
+    echo -e "  ${GRAY}• No internet connection on the Pi"
+    echo -e "  • DNS not resolving (try: ping api.papermc.io)"
+    echo -e "  • Firewall blocking HTTPS${NC}"
+    echo ""
+    echo -ne "  ${CYAN}Type a version manually (e.g. 1.21.4) or press Enter to cancel:${NC} "
+    read -r MANUAL_VERSION
+    if [ -z "$MANUAL_VERSION" ]; then
+      error "Cancelled."
+      return
     fi
-  done
+    MC_VERSION="$MANUAL_VERSION"
+    API_OK=false
+  else
+    # Show last 10 versions
+    echo ""
+    echo -e "  ${BOLD}Available versions (latest 10):${NC}"
+    echo "$VERSIONS" | tail -10 | while read -r v; do
+      echo -e "    ${GREEN}•${NC} $v"
+    done
+    LATEST=$(echo "$VERSIONS" | tail -1)
+    echo ""
+
+    while true; do
+      echo -ne "  ${CYAN}Minecraft version${NC} [press Enter for latest: ${GREEN}$LATEST${NC}]: "
+      read -r MC_VERSION
+      MC_VERSION=${MC_VERSION:-$LATEST}
+
+      if version_exists "$MC_VERSION"; then
+        break
+      else
+        error "'$MC_VERSION' is not a valid PaperMC version. Try again."
+      fi
+    done
+  fi
 
   # ── RAM Allocation ────────────────────────────────────────────
   echo ""
